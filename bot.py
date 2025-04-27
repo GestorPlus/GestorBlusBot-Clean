@@ -2,28 +2,24 @@ import os
 from dotenv import load_dotenv
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
-from services.gsheets import find_rows_by_nif, update_telegram_ids
+from services.gsheets import find_rows_by_nif, update_telegram_ids, get_all_active_subscribers, mark_report_as_submitted
 from utils.lang import get_text
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from datetime import date
-from services.gsheets import get_all_active_subscribers
 from utils.date_tools import is_two_days_before_last_working_day
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from services.reminders import send_client_report_reminders
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from services.gsheets import mark_report_as_submitted
-from datetime import time
 
 # Это тестовый комментарий
 print("Привет, мир!")
 
-# Загружаем токен из .en
+# Загружаем токен из .env
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_CHAT_ID = 5183772550
 
 waiting_for_nif = {}
+MAX_NIF_ATTEMPTS = 3  # Максимум 3 попытки ввода NIF
 waiting_for_consultation = {}  # ждём текст вопроса
 consultation_data = {}         # временное хранилище текста и времени
 waiting_for_consultation_time = {}
@@ -38,17 +34,17 @@ def get_menu_keyboard():
 # Стартовая команда
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Приветственное сообщение из lang.py
-    await update.message.reply_text(get_text("intro_text"))
+    waiting_for_nif[update.effective_chat.id] = False
+    waiting_for_consultation[update.effective_chat.id] = False
+    waiting_for_consultation_time[update.effective_chat.id] = False
 
-    # Кнопки
     keyboard = [
         [KeyboardButton("👋 Я уже с вами"), KeyboardButton("✨ Пока не с вами")]
     ]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-    # Вопрос: кто ты
-    await update.message.reply_text(get_text("start_prompt"), reply_markup=reply_markup)
+    text = f"{get_text('intro_text')}\n\n{get_text('start_prompt')}"
+    await update.message.reply_text(text, reply_markup=reply_markup)
 
 # После всех импортов и глобальных переменных:
 
@@ -126,8 +122,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Если никаких специальных условий нет, обрабатываем стандартное меню
-    await handle_standard_menu(chat_id, text, update, context)
-
     await handle_standard_menu(chat_id, text, update, context)
 
 
@@ -227,7 +221,7 @@ async def handle_nif(chat_id, text, update):
 
     waiting_for_nif[chat_id] = False
 
-# 🟢 Обрабатываем обычные нажатия кнопоikkkkkkkkkkkkк
+# 🟢 Обрабатываем обычные нажатия кнопок
 async def handle_standard_menu(chat_id, text, update, context):
     user = update.effective_user
     username = user.username or f"{user.first_name} {user.last_name or ''}".strip()
@@ -244,8 +238,9 @@ async def handle_standard_menu(chat_id, text, update, context):
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text(
-            "Рада приветствовать тебя здесь 🤗\n"
-            "Чем могу помочь? Выбери, пожалуйста:", reply_markup=reply_markup
+            "Рада приветствовать тебя здесь 🤗\n\n"
+            "Чем могу помочь? Выбери, пожалуйста:",
+            reply_markup=reply_markup
         )
     elif text == "📩 Уведомления о подаче деклараций":
         from services.gsheets import add_aeat_subscriber
@@ -256,19 +251,38 @@ async def handle_standard_menu(chat_id, text, update, context):
         add_subscriber_to_seguridad_social(chat_id, username)
         await update.message.reply_text("Я буду напоминать тебе за 2 дня до списания в Seguridad Social 💶")
     elif text == "🗓 Консультация":
+        # Устанавливаем ожидание для консультации
         waiting_for_consultation[chat_id] = True
         consultation_data[chat_id] = {}
-        await update.message.reply_text("Кратко опиши свой вопрос 💬")
+
+        # Создаем клавиатуру с кнопкой "📋 Меню"
+        keyboard = [
+            [KeyboardButton("📋 Меню")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+        await update.message.reply_text(
+            "✍️ Кратко опиши свой вопрос.\n\n"
+            "Я постараюсь помочь как можно быстрее!",
+            reply_markup=reply_markup
+        )
     elif text == "🤝 Хочу работать с вами":
         waiting_for_client_request[chat_id] = True
         await update.message.reply_text(
-            "Спасибо за доверие 🤗\n"
+            "Спасибо за доверие 🤗\n\n"
             "Пожалуйста, напиши: имя, контакты (телефон или e-mail) и кратко в чём нужна помощь 💼"
         )
     else:
+        # Создаем клавиатуру с кнопкой "📋 Меню"
+        keyboard = [
+            [KeyboardButton("📋 Меню")]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
         await update.message.reply_text(
             "Спасибо! Я всё записал 😊\n\n"
-            "Если хочешь вернуться в меню — нажми 📋 Меню"
+            "Если хочешь вернуться в меню — нажми 📋 Меню",
+            reply_markup=reply_markup
         )
 
     # Уведомление о списании в Seguridad Social
@@ -357,67 +371,58 @@ async def send_good_morning(context: ContextTypes.DEFAULT_TYPE):
 # Запуск бота
 async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    await send_client_report_reminders(app)  # временный вызов
     # 👥 Обработчики команд и сообщений
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_callback))  
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CommandHandler("menu", handle_menu))  
 
     # ⏰ Планировщик задач
     scheduler = AsyncIOScheduler()
 
-    # 📆 Ежедневная задача в 9:30 — рассылает напоминания о Seguridad Social
+    # 📆 Ежедневная задача в 9:28 — напоминание о Seguridad Social
     scheduler.add_job(
         send_ss_reminders,
         trigger="cron",
         hour=9,
         minute=28,
+        timezone='Europe/Madrid',
         args=[app]
     )
-    # 🕘 Ежедневная рассылка деклараций AEAT в 9:15
+
+    # 🕘 Ежедневная рассылка деклараций AEAT в 9:18
     scheduler.add_job(
         send_aeat_reminders,
         trigger="cron",
         hour=9,
         minute=18,
+        timezone='Europe/Madrid',
         args=[app]
     )
-    from datetime import datetime, timedelta
 
-    #персональные уведомления клиентам
-    scheduler.add_job(send_client_report_reminders, "cron", hour=9, minute=15, args=[app])
-
-    # Тестовая задача — отправка через 1 минуту
-    #scheduler.add_job(
-    #    send_aeat_reminders,
-    #    trigger="date",
-    #    run_date=datetime.now() + timedelta(minutes=1),
-    #    args=[app]
-    #)
-    ## 🧪 Временная тестовая задача — срабатывает через 1 минуту после запуска
-    #scheduler.add_job(
-    #    send_ss_reminders,
-    #    trigger="date",
-    #    run_date=datetime.now() + timedelta(minutes=1),
-    #    args=[app]
-    #)
+    # 🌟 Персональные уведомления клиентам в 9:15
     scheduler.add_job(
         send_client_report_reminders,
-        trigger="date",
-        run_date=datetime.now() + timedelta(minutes=1),
+        trigger="cron",
+        hour=9,
+        minute=15,
+        timezone='Europe/Madrid',
         args=[app]
     )
 
+    # ☀️ Доброе утро в 9:00
     scheduler.add_job(
         send_good_morning,
         trigger='cron',
         hour=9,
         minute=0,
-        timezone='Europe/Madrid',  # твой часовой пояс
-        args=[app]  # передаём application в context
+        timezone='Europe/Madrid',
+        args=[app]
     )
-    
+
     scheduler.start()
+    await app.run_polling()
+
 
 
 
