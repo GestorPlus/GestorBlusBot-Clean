@@ -2,14 +2,23 @@ import os
 from dotenv import load_dotenv
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
-from services.gsheets import find_rows_by_nif, update_telegram_ids, get_all_active_subscribers, mark_report_as_submitted, add_or_update_user_visit
+from services.gsheets import find_rows_by_nif, update_telegram_ids, get_all_active_subscribers, mark_report_as_submitted
 from utils.lang import get_text
 from utils.date_tools import is_two_days_before_last_working_day
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
 from datetime import date, datetime, time, timedelta
 from services.reminders import send_client_report_reminders
-
+from services.gsheets import (
+    find_rows_by_nif,
+    update_telegram_ids,
+    get_all_active_subscribers,
+    mark_report_as_submitted,
+    add_or_update_user_visit,
+    find_rows_by_chat_id,
+    update_row_visits,
+    append_row_visits
+)
 
 
 # Загружаем токен из .env
@@ -53,12 +62,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Здесь вызываем запись в Google Sheet
     user = update.effective_user
     username = user.username or f"{user.first_name} {user.last_name or ''}".strip()
-    add_or_update_user_visit(
+
+    # Собираем массив значений для столбцов A–D:
+    row_values = [
         chat_id,
         username,
         visited_users[chat_id],   # дата первого визита
         visit_counts[chat_id]     # текущее число визитов
-    )
+    ]
+
+    # Ищем, есть ли уже строка с этим chat_id
+    rows = find_rows_by_chat_id(chat_id)
+    if rows:
+        # Обновляем первую найденную строку (A{row}:D{row})
+        update_row_visits(rows[0], row_values)
+    else:
+        # Добавляем новую строку в конец
+        append_row_visits(row_values)
+
+    # Сбрасываем флаги ожидания ответов
     waiting_for_nif[update.effective_chat.id] = False
     waiting_for_consultation[update.effective_chat.id] = False
     waiting_for_consultation_time[update.effective_chat.id] = False

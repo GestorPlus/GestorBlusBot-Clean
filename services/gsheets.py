@@ -322,3 +322,17 @@ def mark_report_as_submitted(chat_id, id_informe):
 
     #print(f"⚠️ Не найдена строка для обновления: {chat_id}, {id_informe}")
     return False
+
+def add_or_update_user_visit(chat_id: int, row_values: list):
+    """
+    Если для chat_id уже есть строка — обновляем её,
+    иначе — добавляем новую.
+    """
+    # найдём номера строк с этим chat_id
+    rows = find_rows_by_chat_id(chat_id)
+    if rows:
+        # обновляем первую найденную
+        update_row_visits(rows[0], row_values)
+    else:
+        # добавляем новую
+        append_row_visits(row_values)
