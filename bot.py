@@ -10,13 +10,12 @@ import asyncio
 from datetime import date, datetime, time, timedelta
 from services.reminders import send_client_report_reminders
 
-# Это тестовый комментарий
-print("Привет, мир!")
 
 # Загружаем токен из .env
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_CHAT_ID = 5183772550
+GROUP_CHAT_ID=-1002423634049
 
 waiting_for_nif = {}
 MAX_NIF_ATTEMPTS = 3  # Максимум 3 попытки ввода NIF
@@ -24,6 +23,10 @@ waiting_for_consultation = {}  # ждём текст вопроса
 consultation_data = {}         # временное хранилище текста и времени
 waiting_for_consultation_time = {}
 waiting_for_client_request = {}
+nif_attempts = {}  # счётчик попыток ввода NIF/NIE
+is_known_client = {}  # статус: chat_id → True, если пользователь ввёл корректный NIF/NIE
+visited_users = {}      # chat_id → дата первого визита (datetime.date)
+visit_counts = {}       # chat_id → число визитов
 
 # 📋 Клавиатура с кнопкой "Меню"
 def get_menu_keyboard():
@@ -34,6 +37,19 @@ def get_menu_keyboard():
 # Стартовая команда
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Получаем chat_id
+    chat_id = update.effective_chat.id
+
+    # БЛОК УЧЁТА ВИЗИТОВ 
+    first_visit = visited_users.get(chat_id)
+    if not first_visit:
+        # Первый заход
+        visited_users[chat_id] = date.today()
+        visit_counts[chat_id] = 1
+    else:
+        # Не первый заход
+        visit_counts[chat_id] += 1
+    #КОНЕЦ БЛОКА УЧЁТА ВИЗИТОВ
     waiting_for_nif[update.effective_chat.id] = False
     waiting_for_consultation[update.effective_chat.id] = False
     waiting_for_consultation_time[update.effective_chat.id] = False
@@ -162,6 +178,15 @@ async def handle_consultation_time(chat_id, text, update, context):
              f"🗓 Время: {consultation_data[chat_id]['time']}"
     )
 
+    # дублируем в групповой чат
+    await context.bot.send_message(
+        chat_id=GROUP_CHAT_ID,
+        text=f"📥 Новая заявка на консультацию!\n"
+            f"👤 @{username}\n"
+            f"💬 {consultation_data[chat_id]['question']}\n"
+            f"🗓 {consultation_data[chat_id]['time']}"
+    )
+
 # 🟢 Обрабатываем заявку на клиента
 async def handle_client_request(chat_id, text, update, context):
     from services.gsheets import add_client_request
@@ -187,6 +212,12 @@ async def handle_client_request(chat_id, text, update, context):
              f"👤 Пользователь: @{username}\n"
              f"💬 Что написал: {text}"
     )
+    await context.bot.send_message(
+        chat_id=GROUP_CHAT_ID,
+        text=f"🤝 Новая заявка на сотрудничество!\n"
+             f"👤 Пользователь: @{username}\n"
+             f"💬 Что написал: {text}"
+    )
 
     waiting_for_client_request[chat_id] = False
 
@@ -199,11 +230,18 @@ async def handle_consultation(chat_id, text, update, context):
 
 # 🟢 Обрабатываем ввод NIF/NIE
 async def handle_nif(chat_id, text, update):
-    nif = text
+    # считаем попытку
+    nif_attempts[chat_id] = nif_attempts.get(chat_id, 0) + 1
+
     from services.gsheets import find_rows_by_nif, update_telegram_ids
-    rows = find_rows_by_nif(nif)
+    rows = find_rows_by_nif(text)
 
     if rows:
+        # успех — сбрасываем счётчик и флаг ожидания
+        nif_attempts.pop(chat_id, None)
+        waiting_for_nif[chat_id] = False
+        is_known_client[chat_id] = True
+
         update_telegram_ids(rows, chat_id)
         await update.message.reply_text(
             "Спасибо! Я нашёл тебя в системе и настроил персональные напоминания 🧾\n"
@@ -216,74 +254,113 @@ async def handle_nif(chat_id, text, update):
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text("Что тебе нужно? Выбери, пожалуйста:", reply_markup=reply_markup)
-    else:
-        await update.message.reply_text("К сожалению, твой NIF/NIE не найден. Проверь корректность.")
 
-    waiting_for_nif[chat_id] = False
+    else:
+        # не нашли — проверяем, сколько осталось попыток
+        attempts = nif_attempts[chat_id]
+        if attempts < MAX_NIF_ATTEMPTS:
+            left = MAX_NIF_ATTEMPTS - attempts
+            waiting_for_nif[chat_id] = True
+            await update.message.reply_text(
+                f"К сожалению, твой NIF/NIE не найден. Осталось попыток: {left}. Проверь корректность и попробуй ещё раз."
+            )
+        else:
+            # исчерпали — возврат к выбору клиента или новичка
+            nif_attempts.pop(chat_id, None)
+            waiting_for_nif[chat_id] = False
+            await update.message.reply_text("К сожалению, вы исчерпали 3 попытки. Вернёмся к началу.")
+
+            # выводим исходный выбор (👋 Я уже с вами / ✨ Пока не с вами)
+            keyboard = [
+                [KeyboardButton("👋 Я уже с вами"), KeyboardButton("✨ Пока не с вами")]
+            ]
+            markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            await update.message.reply_text(get_text("start_prompt"), reply_markup=markup)
 
 # 🟢 Обрабатываем обычные нажатия кнопок
 async def handle_standard_menu(chat_id, text, update, context):
     user = update.effective_user
     username = user.username or f"{user.first_name} {user.last_name or ''}".strip()
 
+    # Меню клиентов
+    client_menu = ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("💶 Напоминания о Seguridad Social")],
+            [KeyboardButton("🗓 Консультация")]
+        ],
+        resize_keyboard=True
+    )
+
+    # Меню новичков
+    new_user_menu = ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("📩 Уведомления о подаче деклараций")],
+            [KeyboardButton("💶 Напоминания о Seguridad Social")],
+            [KeyboardButton("🗓 Консультация")],
+            [KeyboardButton("🤝 Хочу работать с вами")]
+        ],
+        resize_keyboard=True
+    )
+
+    # Если уже клиент — запрашиваем NIF
     if text == "👋 Я уже с вами":
         waiting_for_nif[chat_id] = True
         await update.message.reply_text("Пожалуйста, введите ваш NIF или NIE:")
-    elif text == "✨ Пока не с вами":
-        keyboard = [
-            ["📩 Уведомления о подаче деклараций"],
-            ["💶 Напоминания о Seguridad Social"],
-            ["🗓 Консультация"],
-            ["🤝 Хочу работать с вами"]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        return
+
+    # Новичок впервые
+    if text == "✨ Пока не с вами":
         await update.message.reply_text(
-            "Рада приветствовать тебя здесь 🤗\n\n"
-            "Чем могу помочь? Выбери, пожалуйста:",
-            reply_markup=reply_markup
+            "Рада приветствовать тебя здесь 🤗\n\nЧем могу помочь? Выбери, пожалуйста:",
+            reply_markup=new_user_menu
         )
-    elif text == "📩 Уведомления о подаче деклараций":
+        return
+
+    # Подписки и действия
+    if text == "📩 Уведомления о подаче деклараций":
         from services.gsheets import add_aeat_subscriber
         add_aeat_subscriber(chat_id, username)
-        await update.message.reply_text("Отлично! Я буду напоминать тебе о сроках подачи деклараций 📅")
-    elif text == "💶 Напоминания о Seguridad Social":
+        markup = client_menu if is_known_client.get(chat_id) else new_user_menu
+        await update.message.reply_text(
+            "Отлично! Я буду напоминать тебе о сроках подачи деклараций 📅",
+            reply_markup=markup
+        )
+        return
+
+    if text == "💶 Напоминания о Seguridad Social":
         from services.gsheets import add_subscriber_to_seguridad_social
         add_subscriber_to_seguridad_social(chat_id, username)
-        await update.message.reply_text("Я буду напоминать тебе за 2 дня до списания в Seguridad Social 💶")
-    elif text == "🗓 Консультация":
-        # Устанавливаем ожидание для консультации
+        markup = client_menu if is_known_client.get(chat_id) else new_user_menu
+        await update.message.reply_text(
+            "Я буду напоминать тебе за 2 дня до списания в Seguridad Social 💶",
+            reply_markup=markup
+        )
+        return
+
+    if text == "🗓 Консультация":
         waiting_for_consultation[chat_id] = True
         consultation_data[chat_id] = {}
-
-        # Создаем клавиатуру с кнопкой "📋 Меню"
-        keyboard = [
-            [KeyboardButton("📋 Меню")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
+        markup = client_menu if is_known_client.get(chat_id) else ReplyKeyboardMarkup([[KeyboardButton("📋 Меню")]], resize_keyboard=True)
         await update.message.reply_text(
-            "✍️ Кратко опиши свой вопрос.\n\n"
-            "Я постараюсь помочь как можно быстрее!",
-            reply_markup=reply_markup
+            "✍️ Кратко опиши свой вопрос.\n\nЯ постараюсь помочь как можно быстрее!",
+            reply_markup=markup
         )
-    elif text == "🤝 Хочу работать с вами":
+        return
+
+    if text == "🤝 Хочу работать с вами":
         waiting_for_client_request[chat_id] = True
+        markup = client_menu if is_known_client.get(chat_id) else new_user_menu
         await update.message.reply_text(
-            "Спасибо за доверие 🤗\n\n"
-            "Пожалуйста, напиши: имя, контакты (телефон или e-mail) и кратко в чём нужна помощь 💼"
+            "Спасибо за доверие 🤗\n\nПожалуйста, напиши: имя, контакты (телефон или e-mail) и кратко в чём нужна помощь 💼",
+            reply_markup=markup
         )
-    else:
-        # Создаем клавиатуру с кнопкой "📋 Меню"
-        keyboard = [
-            [KeyboardButton("📋 Меню")]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        return
 
-        await update.message.reply_text(
-            "Спасибо! Я всё записал 😊\n\n"
-            "Если хочешь вернуться в меню — нажми 📋 Меню",
-            reply_markup=reply_markup
-        )
+    # По умолчанию — кнопка "Меню"
+    await update.message.reply_text(
+        "Спасибо! Я всё записал 😊\n\nЕсли хочешь вернуться в меню — нажми 📋 Меню",
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton("📋 Меню")]], resize_keyboard=True)
+    )
 
     # Уведомление о списании в Seguridad Social
 async def send_ss_reminders(app):
@@ -347,6 +424,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("submitted:"):
         id_informe = data.split(":")[1]
         chat_id = query.from_user.id
+        
 
         success = mark_report_as_submitted(chat_id, id_informe)
 

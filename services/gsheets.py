@@ -168,6 +168,8 @@ def get_today_aeat_reports():
 
     return reports
 
+
+
 #рассылка информации по декларациям для неклиентов - аутономо
 def get_today_aeat_reports():
     gc = get_gsheet_client()
