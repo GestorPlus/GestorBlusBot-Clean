@@ -2,6 +2,8 @@ import gspread
 import os
 import json
 from google.oauth2 import service_account
+from dotenv import load_dotenv
+load_dotenv()  # подгружаем переменные из .env в этот модуль
 
 if not os.path.exists('credentials.json'):
     credentials_data = {
@@ -19,6 +21,10 @@ if not os.path.exists('credentials.json'):
     with open('credentials.json', 'w') as f:
         json.dump(credentials_data, f)
 
+# ID Google-таблицы для статистики визитов
+VISITS_SHEET_ID = "1HH35Yk1wfDs-_vgsx58a0b-Nqg6pLhQnd4Sfqk_-Fl0"
+
+
 def get_gsheet_client():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -27,6 +33,40 @@ def get_gsheet_client():
     credentials = service_account.Credentials.from_service_account_file('credentials.json', scopes=scopes)
     return gspread.authorize(credentials)
 
+
+# ─────────── Функции для работы с таблицей визитов ───────────
+
+def get_visits_sheet():
+    """
+    Возвращает объект sheet1 вашей таблицы визитов.
+    """
+    gc = get_gsheet_client()
+    return gc.open_by_key(VISITS_SHEET_ID).sheet1
+
+
+def find_rows_by_chat_id(chat_id: int) -> list[int]:
+    """
+    Ищет все строки в колонке A, где встречается chat_id, и возвращает номера строк.
+    """
+    sheet = get_visits_sheet()
+    cells = sheet.findall(str(chat_id), in_column=1)
+    return [cell.row for cell in cells]
+
+
+def update_row_visits(row_num: int, row_values: list):
+    """
+    Обновляет диапазон A{row_num}:D{row_num} значениями из row_values.
+    """
+    sheet = get_visits_sheet()
+    sheet.update(f"A{row_num}:D{row_num}", [row_values])
+
+
+def append_row_visits(row_values: list):
+    """
+    Добавляет новую строку в конец листа визитов.
+    """
+    sheet = get_visits_sheet()
+    sheet.append_row(row_values)
 
 # Поиск клиента по NIF/NIE
 def find_rows_by_nif(nif: str):

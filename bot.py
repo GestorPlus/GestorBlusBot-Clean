@@ -2,13 +2,14 @@ import os
 from dotenv import load_dotenv
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
-from services.gsheets import find_rows_by_nif, update_telegram_ids, get_all_active_subscribers, mark_report_as_submitted
+from services.gsheets import find_rows_by_nif, update_telegram_ids, get_all_active_subscribers, mark_report_as_submitted, add_or_update_user_visit
 from utils.lang import get_text
 from utils.date_tools import is_two_days_before_last_working_day
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
 from datetime import date, datetime, time, timedelta
 from services.reminders import send_client_report_reminders
+
 
 
 # Загружаем токен из .env
@@ -40,16 +41,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Получаем chat_id
     chat_id = update.effective_chat.id
 
-    # БЛОК УЧЁТА ВИЗИТОВ 
+    # — Блок учёта визитов —
     first_visit = visited_users.get(chat_id)
     if not first_visit:
-        # Первый заход
         visited_users[chat_id] = date.today()
         visit_counts[chat_id] = 1
     else:
-        # Не первый заход
         visit_counts[chat_id] += 1
-    #КОНЕЦ БЛОКА УЧЁТА ВИЗИТОВ
+    # — Конец блока —
+
+    # Здесь вызываем запись в Google Sheet
+    user = update.effective_user
+    username = user.username or f"{user.first_name} {user.last_name or ''}".strip()
+    add_or_update_user_visit(
+        chat_id,
+        username,
+        visited_users[chat_id],   # дата первого визита
+        visit_counts[chat_id]     # текущее число визитов
+    )
     waiting_for_nif[update.effective_chat.id] = False
     waiting_for_consultation[update.effective_chat.id] = False
     waiting_for_consultation_time[update.effective_chat.id] = False
@@ -72,6 +81,7 @@ async def send_menu(chat_id, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [KeyboardButton("💶 Напоминания о Seguridad Social")],
             [KeyboardButton("🗓 Консультация")],
+            [KeyboardButton("🤝 Хочу работать с вами")], 
         ]
     else:
         # 🌱 Меню для новых пользователей
